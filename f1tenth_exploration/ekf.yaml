@@ -1,0 +1,65 @@
+# ============================================================================
+# robot_localization EKF — fuses VESC wheel odometry with the VESC IMU.
+#
+# Why: vesc_to_odom derives yaw by integrating the *commanded* steering angle
+# through a bicycle model. That is open-loop — it does not know about tyre slip,
+# servo lag or steering trim, so heading drifts badly on an Ackermann car. The
+# VESC's onboard gyro measures yaw rate directly. Fusing the two gives a much
+# steadier odom->base_link, which is what SLAM Toolbox scan-matches against.
+#
+# Split of responsibilities:
+#   * wheel odometry  -> forward velocity (vx). Wheel encoders are good at speed.
+#   * IMU gyro        -> yaw rate (vyaw).       The gyro is good at rotation.
+#
+# Only velocities are fused, never absolute pose: in the odom frame the EKF is a
+# dead-reckoner, and SLAM Toolbox corrects the accumulated drift via map->odom.
+#
+# NOTE: this consumes /imu/data (from vesc_imu_conditioner.py), NOT
+# /sensors/imu/raw. The raw topic has an empty frame_id, zero covariances and
+# non-SI units, all three of which robot_localization will choke on.
+# ============================================================================
+ekf_filter_node:
+  ros__parameters:
+    frequency: 50.0
+    sensor_timeout: 0.2
+    two_d_mode: true              # planar car: zeroes z, roll, pitch
+    publish_tf: true              # this node owns odom -> base_link
+    transform_time_offset: 0.0
+    transform_timeout: 0.0
+    print_diagnostics: true
+    debug: false
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom             # odom-frame EKF: continuous, no jumps
+
+    # ---- wheel odometry: forward velocity only -----------------------------
+    # Order: x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az
+    odom0: /odom
+    odom0_config: [false, false, false,
+                   false, false, false,
+                   true,  false, false,
+                   false, false, false,
+                   false, false, false]
+    odom0_queue_size: 10
+    odom0_differential: false
+    odom0_relative: false
+    odom0_nodelay: true
+
+    # ---- IMU: yaw rate only ------------------------------------------------
+    # Absolute orientation from the VESC is deliberately NOT fused: it is an
+    # unreferenced AHRS estimate that can jump, and a jump in the odom frame
+    # would tear the SLAM map. Linear acceleration is also skipped — on an RC
+    # car the chassis vibration makes it far noisier than it is useful.
+    imu0: /imu/data
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_queue_size: 10
+    imu0_differential: false
+    imu0_relative: false
+    imu0_nodelay: true
+    imu0_remove_gravitational_acceleration: true

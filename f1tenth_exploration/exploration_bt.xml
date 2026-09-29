@@ -1,0 +1,81 @@
+<?xml version="1.0"?>
+<!--
+  F1Tenth exploration behavior tree.
+
+  - Replans the global path at 1 Hz (RateController) so it adapts to the SLAM
+    map as it grows (the old BT planned once and never re-planned).
+  - Per-component recoveries: if ComputePathToPose fails, clear the GLOBAL
+    costmap and retry (handles phantom obstacles blocking the plan); if
+    FollowPath fails, BackUp off the obstacle then clear the LOCAL costmap.
+  - BackUp appears ONLY in the outer RecoveryActions, never in the per-component
+    FollowPath recovery. The inner one fired on every controller hiccup and made
+    the car pace forward and back without ever getting anywhere.
+
+  - Outer RecoveryNode escalates to a RoundRobin of [BackUp, ClearEntireCostmap
+    (local+global), Wait] so repeated failures cycle physical extraction,
+    clearing, and a pause — BackUp first so the Ackermann car reverses off a
+    wall instead of wiping the map and driving into it again.
+  - No Spin: the Ackermann car can't rotate in place.
+
+  - Recovery order is BackUp -> Clear -> longer BackUp -> Wait, and it matters.
+    Clearing before reversing wipes the very obstacle the car is pinned against,
+    so the replanner routes straight back into it. Reversing first restores
+    steering room; clearing then handles the case where the block was a stale
+    mark rather than a real object.
+
+  - BackUp is deliberately SHORT (0.20 m, was 0.40 m). The Hokuyo scans only
+    -135..+135 deg, so the rear +-45 deg is a PERMANENT BLIND SPOT, and the
+    local costmap reports 0% unknown — unobserved cells behind the car read as
+    FREE. BackUp's collision check therefore sees a clear path into walls the
+    car has never looked at, and reverses into them. Reverse motion on this car
+    is blind by construction; the only mitigations are to keep it short or to
+    add a rear-facing sensor. Do not raise backup_dist without one.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="5" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <RecoveryNode number_of_retries="1" name="ComputePathRecovery">
+              <ClearEntireCostmap name="ClearGlobal" service_name="global_costmap/clear_entirely_global_costmap"/>
+              <Wait wait_duration="1.0"/>
+            </RecoveryNode>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <!-- No BackUp here. This inner recovery fires on every FollowPath
+               hiccup, so reversing from it produced the constant forward-
+               reverse pacing. Clear the local costmap and let the 1 Hz
+               replanner try again; BackUp is reserved for the outer
+               RecoveryActions below, i.e. genuine recovery only. -->
+          <RecoveryNode number_of_retries="1" name="FollowPathRecovery">
+            <ClearEntireCostmap name="ClearLocal" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <Wait wait_duration="1.0"/>
+          </RecoveryNode>
+        </RecoveryNode>
+      </PipelineSequence>
+      <RoundRobin name="RecoveryActions">
+        <!-- 1. Physical extraction FIRST. A wedged Ackermann car cannot turn out
+             of a nose-in contact; it has to reverse before anything else helps.
+             0.30 m is enough to clear a bumper contact and re-open steering
+             room, while staying short because the LiDAR scans only -135..+135
+             deg and reverse is therefore BLIND. Do not raise this without a
+             rear sensor. -->
+        <BackUp backup_dist="0.30" backup_speed="0.15"/>
+        <!-- 2. Then clear, in case the block was a stale costmap mark rather
+             than a real obstacle. Clearing FIRST would wipe the evidence and
+             send the car straight back into the same thing. -->
+        <Sequence name="ClearingActions">
+          <ClearEntireCostmap name="ClearLocalSub" service_name="local_costmap/clear_entirely_local_costmap"/>
+          <ClearEntireCostmap name="ClearGlobalSub" service_name="global_costmap/clear_entirely_global_costmap"/>
+        </Sequence>
+        <!-- 3. A second, longer reverse if one short one was not enough. -->
+        <BackUp backup_dist="0.45" backup_speed="0.15"/>
+        <Wait wait_duration="2.0"/>
+      </RoundRobin>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
