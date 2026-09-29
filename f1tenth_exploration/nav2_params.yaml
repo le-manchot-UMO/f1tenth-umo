@@ -1,0 +1,312 @@
+# ============================================================================
+# Nav2 parameters — F1TENTH autonomous exploration (ROS 2 Humble, real car)
+#
+# Adapted for Humble from the repo-root nav2_params.yaml:
+#   * recoveries_server -> behavior_server, nav2_recoveries/* -> nav2_behaviors/*
+#     (the server was renamed in Humble; the old names silently never load)
+#   * dropped the duplicate local_costmap block that was nested under
+#     controller_server (costmaps are their own nodes; the nested copy is dead)
+#   * dropped voxel_layer: the Hokuyo is a planar 2D scanner, so obstacle_layer
+#     is the correct consumer. Running both on the same /scan just double-marks.
+#   * dropped amcl + map_server: SLAM Toolbox owns /map and the map->odom TF
+#     during exploration. Re-add them only for localisation against a saved map.
+#
+# Geometry: car is ~0.70 m x 0.40 m. inscribed radius 0.20, circumscribed ~0.40.
+# Speed is capped at 0.5 m/s here — this is the main safety knob.
+# ============================================================================
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odometry/filtered
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    # Exploration tree: replans at 1 Hz and recovers with BackUp (never Spin —
+    # an Ackermann car cannot rotate in place). Set by run_exploration.sh.
+    default_nav_to_pose_bt_xml: "/home/f1-prime/f1tenth_exploration/exploration_bt.xml"
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    # 2.0 s, up from 0.3. Exploration deliberately plans through unknown space,
+    # so the controller WILL transiently predict a collision the moment the
+    # LiDAR reveals something the plan did not know about. At 0.3 s it gave up
+    # almost immediately — 178 "collision ahead" warnings turned into 28 aborted
+    # goals. 2.0 s lets the 1 Hz replanner produce a new path before the goal is
+    # abandoned. This does not weaken collision checking; the car still refuses
+    # to drive into anything, it just keeps trying to find a way round.
+    failure_tolerance: 2.0
+    progress_checker_plugin: progress_checker
+    goal_checker_plugins: [general_goal_checker]
+    controller_plugins: [FollowPath]
+    progress_checker:
+      plugin: nav2_controller::SimpleProgressChecker
+      required_movement_radius: 0.05
+      movement_time_allowance: 10.0
+    general_goal_checker:
+      plugin: nav2_controller::SimpleGoalChecker
+      xy_goal_tolerance: 0.15
+      yaw_goal_tolerance: 0.15
+      stateful: true
+    FollowPath:
+      plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+      # An Ackermann car cannot rotate in place: rotate_to_heading MUST stay off
+      # or the controller commands a pure spin the car can never execute and the
+      # goal times out with the car sitting still.
+      use_rotate_to_heading: false
+      # NOTE: Humble's RPP has no min_turning_radius parameter, so it will
+      # happily command a curvature this car cannot steer. The hard
+      # kinematic limit is enforced downstream in cmd_vel_to_ackermann.py
+      # (max_steering_angle), which clamps rather than lets it oversteer.
+      # 0.4. RPP projects the footprint forward by
+      # max_allowed_time_to_collision_up_to_carrot (1 s), so speed sets how far
+      # ahead it looks: 0.4 m/s checks 0.40 m rather than 0.50 m, which cuts
+      # false positives in a cluttered room. Still well above the 0.25 m/s floor.
+      desired_linear_vel: 0.4
+      # 0.85: a short lookahead makes RPP chase every wiggle in the path and
+      # cut corners into obstacles. Longer smooths the followed line out.
+      lookahead_dist: 0.85
+      min_lookahead_dist: 0.5
+      max_lookahead_dist: 1.2
+      lookahead_time: 1.5
+      transform_tolerance: 0.1
+      use_velocity_scaled_lookahead_dist: false
+      min_approach_linear_velocity: 0.25
+      approach_velocity_scaling_dist: 0.3
+      max_angular_accel: 1.0
+      use_interpolation: true
+      allow_reversing: false
+      # Back ON. It is a real safety feature — slow down as costmap cost rises.
+      # It previously dragged the request to 0.19 m/s, just under the ~0.20 m/s
+      # (923 eRPM) at which this motor actually starts, so the car stood still
+      # while Nav2 thought it was driving. The floor below now prevents that,
+      # so the safety behaviour can stay.
+      use_cost_regulated_linear_velocity_scaling: true
+      use_regulated_linear_velocity_scaling: true
+      # MEASURED on this car with speed_threshold.py: the wheels first turned at
+      # 0.20 m/s (923 eRPM); 0.15 m/s (692 eRPM) produced no motion at all.
+      # 0.25 gives one step of margin. Re-measure for any other car.
+      regulated_linear_scaling_min_speed: 0.25
+      # 0.94 m is this car's true minimum turning radius
+      # (wheelbase 0.25 / tan(max steer 0.26 rad)). Slow down for any
+      # curve at or tighter than what the steering can actually track.
+      regulated_linear_scaling_min_radius: 0.9
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 6
+      height: 6
+      resolution: 0.02
+      # 0.56 x 0.28 m — the car's TRUE outside dimensions, trimmed from 0.30 m
+      # wide. 0.28 m is tyre-edge to tyre-edge on a Traxxas Slash 4x4 chassis,
+      # so this footprint now has essentially NO safety margin: the costmap
+      # matches the metal exactly. Any localisation error or map noise is a real
+      # scrape. Widen back toward 0.15 half-width if it starts clipping things.
+      # base_link sits at the REAR AXLE, not the car's centre:
+      # the LiDAR's static transform puts it 0.27 m forward of base_link, so the
+      # body extends much further ahead than behind. The old symmetric
+      # [+-0.35, +-0.20] box claimed 0.35 m of car behind the rear axle where
+      # there is none, and 0.20 m half-width on a 0.15 m half-width car — which
+      # made the inscribed radius 5 cm too big and put the footprint in
+      # permanent collision next to any wall.
+      footprint: "[ [0.45, 0.14], [0.45, -0.14], [-0.11, -0.14], [-0.11, 0.14] ]"
+      transform_tolerance: 0.5
+      plugins: [obstacle_layer, inflation_layer]
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          max_obstacle_height: 2.0
+          raytrace_max_range: 20.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 15.0
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        enabled: true
+        # 0.25, down from 0.35. This does NOT shrink the untraversable zone —
+        # that is fixed at the inscribed radius (0.15 m, the footprint's
+        # half-width). What it shrinks is the soft cost gradient beyond it.
+        # At 0.35 in a room with scattered furniture legs, nearly every cell
+        # carried cost, so cost-regulated scaling throttled the car everywhere
+        # and it crawled. 0.25 keeps a 10 cm cushion past the car's own width.
+        inflation_radius: 0.25
+        # 3.0, down from 10.0. cost_scaling_factor controls how fast cost DECAYS
+        # with distance from an obstacle: a high value (10) collapses to near-zero
+        # almost immediately, so the planner sees a wide plateau of equally-cheap
+        # cells and happily routes right along walls. The car then arrives
+        # nose-in at a shallow angle and wedges, which is exactly what happened.
+        # A low value keeps a graded slope across the free space, so the cheapest
+        # route runs down the MIDDLE of a corridor — straighter paths, and margin
+        # to recover in.
+        cost_scaling_factor: 3.0
+      always_send_full_costmap: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      # 0.56 x 0.28 m — the car's TRUE outside dimensions, trimmed from 0.30 m
+      # wide. 0.28 m is tyre-edge to tyre-edge on a Traxxas Slash 4x4 chassis,
+      # so this footprint now has essentially NO safety margin: the costmap
+      # matches the metal exactly. Any localisation error or map noise is a real
+      # scrape. Widen back toward 0.15 half-width if it starts clipping things.
+      # base_link sits at the REAR AXLE, not the car's centre:
+      # the LiDAR's static transform puts it 0.27 m forward of base_link, so the
+      # body extends much further ahead than behind. The old symmetric
+      # [+-0.35, +-0.20] box claimed 0.35 m of car behind the rear axle where
+      # there is none, and 0.20 m half-width on a 0.15 m half-width car — which
+      # made the inscribed radius 5 cm too big and put the footprint in
+      # permanent collision next to any wall.
+      footprint: "[ [0.45, 0.14], [0.45, -0.14], [-0.11, -0.14], [-0.11, 0.14] ]"
+      resolution: 0.02
+      transform_tolerance: 0.5
+      # Unknown space must stay distinct from free space or the frontier
+      # explorer has nothing to chase.
+      track_unknown_space: true
+      plugins: [static_layer, obstacle_layer, inflation_layer]
+      static_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        enabled: true
+        # SLAM Toolbox latches /map; without transient_local the static layer
+        # can miss it and the global costmap stays empty.
+        map_subscribe_transient_local: true
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          max_obstacle_height: 2.0
+          raytrace_max_range: 20.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 15.0
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        enabled: true
+        # 0.25, down from 0.35. This does NOT shrink the untraversable zone —
+        # that is fixed at the inscribed radius (0.15 m, the footprint's
+        # half-width). What it shrinks is the soft cost gradient beyond it.
+        # At 0.35 in a room with scattered furniture legs, nearly every cell
+        # carried cost, so cost-regulated scaling throttled the car everywhere
+        # and it crawled. 0.25 keeps a 10 cm cushion past the car's own width.
+        inflation_radius: 0.25
+        # 3.0, down from 10.0. cost_scaling_factor controls how fast cost DECAYS
+        # with distance from an obstacle: a high value (10) collapses to near-zero
+        # almost immediately, so the planner sees a wide plateau of equally-cheap
+        # cells and happily routes right along walls. The car then arrives
+        # nose-in at a shallow angle and wedges, which is exactly what happened.
+        # A low value keeps a graded slope across the free space, so the cheapest
+        # route runs down the MIDDLE of a corridor — straighter paths, and margin
+        # to recover in.
+        cost_scaling_factor: 3.0
+      always_send_full_costmap: true
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 20.0
+    planner_plugins: [GridBased]
+    GridBased:
+      plugin: nav2_navfn_planner/NavfnPlanner
+      tolerance: 1.0
+      use_astar: true
+      # Exploration goals sit on the edge of unknown space, so the planner has
+      # to be allowed to route through it.
+      allow_unknown: true
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: [spin, backup, drive_on_heading, wait]
+    spin:
+      plugin: nav2_behaviors/Spin
+    backup:
+      plugin: nav2_behaviors/BackUp
+    drive_on_heading:
+      plugin: nav2_behaviors/DriveOnHeading
+    wait:
+      plugin: nav2_behaviors/Wait
+    global_frame: odom
+    robot_base_frame: base_link
+    transform_tolerance: 0.5
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 1.0
+    min_rotational_vel: 0.4
+    rotational_acc_lim: 3.2
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+    loop_rate: 20
+    stop_on_failure: false
+    waypoint_task_executor_plugin: wait_at_waypoint
+    wait_at_waypoint:
+      plugin: nav2_waypoint_follower::WaitAtWaypoint
+      enabled: true
+      waypoint_pause_duration: 200
